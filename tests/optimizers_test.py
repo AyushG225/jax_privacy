@@ -246,6 +246,321 @@ class ScaleThenPrivatizeE2ETest(parameterized.TestCase):
     chex.assert_trees_all_close(aug_params, base_params, atol=1e-5)
 
 
+class DP2RMSPropTest(parameterized.TestCase):
+
+  def test_init_creates_zero_state_matching_nested_params(self):
+    params = {
+        'layer': {'w': jnp.ones((2, 3), dtype=jnp.float32)},
+        'bias': jnp.ones(3, dtype=jnp.float16),
+    }
+    optimizer = optimizers.dp2_rmsprop(0.1, 0.01, 2, 1.0, 0.5)
+
+    state = optimizer.init(params)
+
+    self.assertEqual(int(state.count), 0)
+    chex.assert_trees_all_equal_shapes_and_dtypes(
+        state.grad_accumulator, params
+    )
+    chex.assert_trees_all_equal_shapes_and_dtypes(state.nu, params)
+    chex.assert_trees_all_close(
+        state.grad_accumulator, jax.tree.map(jnp.zeros_like, params)
+    )
+    chex.assert_trees_all_close(state.nu, jax.tree.map(jnp.zeros_like, params))
+
+  def test_alternates_equal_length_sgd_and_rmsprop_phases(self):
+    optimizer = optimizers.dp2_rmsprop(
+        0.1,
+        0.01,
+        interval=2,
+        sgd_clip_norm=2.0,
+        rmsprop_clip_norm=1.0,
+        eps=1.0,
+        rescale_to_unit_norm=False,
+    )
+    grad = jnp.ones(2)
+    state = optimizer.init(grad)
+    is_identity = []
+
+    for _ in range(6):
+      transformed = optimizer.pre_clipping_transform(state)(grad)
+      is_identity.append(bool(jnp.allclose(transformed, grad)))
+      _, state = optimizer.update(jnp.zeros_like(grad), state)
+
+    self.assertSequenceEqual(
+        is_identity, [True, True, False, False, True, True]
+    )
+
+  def test_updates_delayed_moment_and_resets_accumulator(self):
+    optimizer = optimizers.dp2_rmsprop(
+        0.1,
+        0.01,
+        interval=2,
+        sgd_clip_norm=1.0,
+        rmsprop_clip_norm=1.0,
+        decay=0.5,
+        rescale_to_unit_norm=False,
+    )
+    state = optimizer.init(jnp.zeros(1))
+
+    _, state = optimizer.update(jnp.array([2.0]), state)
+    chex.assert_trees_all_close(state.grad_accumulator, jnp.array([2.0]))
+    chex.assert_trees_all_close(state.nu, jnp.array([0.0]))
+
+    _, state = optimizer.update(jnp.array([4.0]), state)
+    chex.assert_trees_all_close(state.grad_accumulator, jnp.array([0.0]))
+    # decay * 0 + (1 - decay) * ((2 + 4) / 2)^2 = 4.5.
+    chex.assert_trees_all_close(state.nu, jnp.array([4.5]))
+
+    _, state = optimizer.update(jnp.array([7.0]), state)
+    chex.assert_trees_all_close(state.nu, jnp.array([4.5]))
+    _, state = optimizer.update(jnp.array([9.0]), state)
+    chex.assert_trees_all_close(state.nu, jnp.array([4.5]))
+
+  @parameterized.parameters(False, True)
+  def test_two_clip_norm_transform_is_equivalent(self, rescale_to_unit_norm):
+    sgd_clip_norm = 2.0
+    rmsprop_clip_norm = 1.0
+    eps = 0.25
+    optimizer = optimizers.dp2_rmsprop(
+        0.1,
+        0.01,
+        interval=2,
+        sgd_clip_norm=sgd_clip_norm,
+        rmsprop_clip_norm=rmsprop_clip_norm,
+        eps=eps,
+        rescale_to_unit_norm=rescale_to_unit_norm,
+    )
+    grad = jnp.array([6.0, 8.0])
+    state = optimizer.init(grad)._replace(
+        count=jnp.array(2, dtype=jnp.int32), nu=jnp.array([1.0, 9.0])
+    )
+
+    transformed = optimizer.pre_clipping_transform(state)(grad)
+    clipped_with_sgd_norm, _ = clipping.clip_pytree(
+        transformed,
+        sgd_clip_norm,
+        rescale_to_unit_norm=rescale_to_unit_norm,
+    )
+    decode_scale = (
+        rmsprop_clip_norm
+        if rescale_to_unit_norm
+        else rmsprop_clip_norm / sgd_clip_norm
+    )
+    actual = clipped_with_sgd_norm * decode_scale
+
+    preconditioned = grad / (jnp.sqrt(state.nu) + eps)
+    expected, _ = clipping.clip_pytree(preconditioned, rmsprop_clip_norm)
+    chex.assert_trees_all_close(actual, expected, atol=1e-6)
+
+  def test_uses_phase_learning_rates_without_undoing_preconditioner(self):
+    optimizer = optimizers.dp2_rmsprop(
+        sgd_learning_rate=0.1,
+        rmsprop_learning_rate=0.01,
+        interval=1,
+        sgd_clip_norm=2.0,
+        rmsprop_clip_norm=1.0,
+        decay=0.0,
+        eps=1e-6,
+        rescale_to_unit_norm=False,
+    )
+    params = jnp.zeros(1)
+    state = optimizer.init(params)
+
+    sgd_updates, state = optimizer.update(jnp.array([2.0]), state, params)
+    chex.assert_trees_all_close(sgd_updates, jnp.array([-0.2]))
+    chex.assert_trees_all_close(state.nu, jnp.array([4.0]))
+
+    transformed = optimizer.pre_clipping_transform(state)(jnp.array([6.0]))
+    rmsprop_updates, _ = optimizer.update(transformed, state, params)
+    # The transformed gradient decodes to 6 / (sqrt(4) + eps), not back to 6.
+    chex.assert_trees_all_close(rmsprop_updates, jnp.array([-0.03]), atol=1e-6)
+
+  def test_jit_across_phase_boundaries(self):
+    optimizer = optimizers.dp2_rmsprop(
+        0.1, 0.01, 2, 2.0, 1.0, rescale_to_unit_norm=False
+    )
+    state = optimizer.init(jnp.zeros(2))
+
+    @jax.jit
+    def run_steps(state, grads):
+      def step(state, grad):
+        transformed = optimizer.pre_clipping_transform(state)(grad)
+        updates, state = optimizer.update(transformed, state)
+        return state, updates
+
+      return jax.lax.scan(step, state, grads)
+
+    state, updates = run_steps(state, jnp.ones((5, 2)))
+
+    self.assertEqual(int(state.count), 5)
+    chex.assert_shape(updates, (5, 2))
+    self.assertTrue(bool(jnp.all(jnp.isfinite(updates))))
+
+  @parameterized.parameters(False, True)
+  def test_default_inner_optimizer_preserves_updates(
+      self, rescale_to_unit_norm
+  ):
+    optimizer = optimizers.dp2_rmsprop(
+        0.1,
+        0.02,
+        2,
+        2.0,
+        1.0,
+        rescale_to_unit_norm=rescale_to_unit_norm,
+    )
+    params = {'layer': {'w': jnp.zeros(2)}, 'bias': jnp.zeros(1)}
+    gradients = jax.tree.map(jnp.ones_like, params)
+    state = optimizer.init(params)
+
+    for step in range(6):
+      use_sgd = step % 4 < 2
+      transformed = optimizer.pre_clipping_transform(state)(gradients)
+      clipped, _ = clipping.clip_pytree(
+          transformed, 2.0, rescale_to_unit_norm=rescale_to_unit_norm
+      )
+      noisy_grad = jax.tree.map(lambda g: g + 0.1, clipped)
+      clip_norm = 2.0 if use_sgd else 1.0
+      decode_scale = clip_norm if rescale_to_unit_norm else clip_norm / 2.0
+      learning_rate = 0.1 if use_sgd else 0.02
+      expected = optax.tree.scale(-learning_rate * decode_scale, noisy_grad)
+
+      updates, state = optimizer.update(noisy_grad, state, params)
+
+      chex.assert_trees_all_close(updates, expected, atol=1e-6)
+      chex.assert_trees_all_equal_shapes_and_dtypes(updates, params)
+
+  @parameterized.parameters(False, True)
+  def test_inner_momentum_and_schedule_persist_across_phases(self, nesterov):
+    inner_optimizer = optax.sgd(
+        lambda count: 1.0 / (count + 1), momentum=0.5, nesterov=nesterov
+    )
+    optimizer = optimizers.dp2_rmsprop(
+        0.1,
+        0.02,
+        2,
+        1.0,
+        1.0,
+        decay=0.5,
+        inner_optimizer=inner_optimizer,
+    )
+    state = optimizer.init(jnp.zeros(1))
+    chex.assert_trees_all_close(
+        state.inner_state, inner_optimizer.init(jnp.zeros(1))
+    )
+    update_fn = jax.jit(optimizer.update)
+    trace = 0.0
+
+    for step, grad in enumerate([2.0, 4.0, 3.0, 5.0, 6.0, 8.0]):
+      trace = grad + 0.5 * trace
+      direction = grad + 0.5 * trace if nesterov else trace
+      learning_rate = 0.1 if step % 4 < 2 else 0.02
+      expected = -learning_rate * direction / (step + 1)
+
+      updates, state = update_fn(jnp.array([grad]), state)
+
+      chex.assert_trees_all_close(updates, jnp.array([expected]), atol=1e-6)
+
+    # The delayed moment uses SGD gradients (averages 3 and 7), before momentum
+    # or learning rates: 0.5 * (0.5 * 3^2) + 0.5 * 7^2 = 26.75.
+    chex.assert_trees_all_close(state.nu, jnp.array([26.75]))
+    chex.assert_trees_all_close(state.grad_accumulator, jnp.zeros(1))
+    self.assertEqual(int(state.count), 6)
+
+  def test_inner_optimizer_receives_params_for_weight_decay(self):
+    inner_optimizer = optax.chain(
+        optax.add_decayed_weights(0.2), optax.sgd(1.0)
+    )
+    optimizer = optimizers.dp2_rmsprop(
+        0.1, 0.02, 1, 1.0, 1.0, inner_optimizer=inner_optimizer
+    )
+    params = {'w': jnp.array([2.0, 3.0])}
+    gradients = {'w': jnp.array([0.5, 1.0])}
+    state = optimizer.init(params)
+    update_fn = jax.jit(optimizer.update)
+
+    for learning_rate in [0.1, 0.02]:
+      expected = {'w': -learning_rate * (gradients['w'] + 0.2 * params['w'])}
+
+      updates, state = update_fn(gradients, state, params)
+
+      chex.assert_trees_all_close(updates, expected, atol=1e-6)
+      params = optax.apply_updates(params, updates)
+
+  def test_inner_optimizer_receives_extra_arguments(self):
+    def inner_update(updates, state, params=None, *, gain):
+      del params
+      return jax.tree.map(lambda g: -gain * g, updates), state + 1
+
+    inner_optimizer = optax.GradientTransformationExtraArgs(
+        init=lambda _: jnp.zeros([], dtype=jnp.int32),
+        update=inner_update,
+    )
+    optimizer = optimizers.dp2_rmsprop(
+        0.1,
+        0.02,
+        1,
+        1.0,
+        1.0,
+        decay=0.0,
+        inner_optimizer=inner_optimizer,
+    )
+    state = optimizer.init(jnp.zeros(1))
+    update_fn = jax.jit(optimizer.update)
+
+    for step, learning_rate in enumerate([0.1, 0.02]):
+      updates, state = update_fn(jnp.ones(1), state, gain=jnp.array(3.0))
+
+      chex.assert_trees_all_close(
+          updates, jnp.array([-learning_rate * 3.0]), atol=1e-6
+      )
+      chex.assert_trees_all_close(state.nu, jnp.ones(1))
+      self.assertEqual(int(state.inner_state), step + 1)
+
+  def test_plain_inner_transformation_ignores_unused_extra_arguments(self):
+    optimizer = optimizers.dp2_rmsprop(
+        0.1, 0.02, 1, 1.0, 1.0, inner_optimizer=optax.scale(-1.0)
+    )
+    state = optimizer.init(jnp.zeros(1))
+
+    updates, _ = optimizer.update(jnp.ones(1), state, unused=True)
+
+    chex.assert_trees_all_close(updates, jnp.array([-0.1]))
+
+  @parameterized.named_parameters(
+      ('interval_type', {'interval': 1.5}, TypeError, 'Python integer'),
+      ('zero_interval', {'interval': 0}, ValueError, 'positive'),
+      (
+          'negative_sgd_lr',
+          {'sgd_learning_rate': -0.1},
+          ValueError,
+          'nonnegative',
+      ),
+      (
+          'negative_rmsprop_lr',
+          {'rmsprop_learning_rate': -0.1},
+          ValueError,
+          'nonnegative',
+      ),
+      ('zero_sgd_clip', {'sgd_clip_norm': 0.0}, ValueError, 'positive'),
+      ('zero_rmsprop_clip', {'rmsprop_clip_norm': 0.0}, ValueError, 'positive'),
+      ('zero_eps', {'eps': 0.0}, ValueError, 'positive'),
+      ('negative_decay', {'decay': -0.1}, ValueError, r'\[0, 1\)'),
+      ('unit_decay', {'decay': 1.0}, ValueError, r'\[0, 1\)'),
+  )
+  def test_rejects_invalid_hyperparameters(self, overrides, error_type, regex):
+    kwargs = dict(
+        sgd_learning_rate=0.1,
+        rmsprop_learning_rate=0.01,
+        interval=2,
+        sgd_clip_norm=1.0,
+        rmsprop_clip_norm=0.5,
+    )
+    kwargs.update(overrides)
+
+    with self.assertRaisesRegex(error_type, regex):
+      optimizers.dp2_rmsprop(**kwargs)
+
+
 class MiscellaneousTest(parameterized.TestCase):
 
   def test_as_augmented_optimizer(self):
