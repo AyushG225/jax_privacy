@@ -317,8 +317,8 @@ def dp2_rmsprop(
     zeros = jax.tree.map(jnp.zeros_like, params)
     return _DP2RMSPropState(
         count=jnp.zeros([], dtype=jnp.int32),
-        grad_accumulator=zeros,
-        nu=zeros,
+        grad_accumulator=jax.tree.map(jnp.zeros_like, params),
+        nu=jax.tree.map(jnp.zeros_like, params),
         inner_state=inner_optimizer.init(params),
     )
 
