@@ -252,6 +252,12 @@ def dp2_rmsprop(
   It delegates to the inner optimizer and scales its updates by the phase
   learning rate. Inner state persists across phases.
 
+  The ``BandMFConfig`` must use ``l2_clip_norm=sgd_clip_norm``, the same
+  ``rescale_to_unit_norm``, and ``normalize_by`` equal to the expected batch
+  size. With the default ``normalize_by=1.0``, ``nu`` is built from batch sums
+  instead of means and comes out about batch-size-squared too large. These
+  settings are not checked.
+
   Based on the authors' Apache-2.0 JAX implementation:
   https://github.com/kenziyuliu/DP2.
 
@@ -305,16 +311,17 @@ def dp2_rmsprop(
   inner_optimizer = optax.with_extra_args_support(inner_optimizer)
 
   cycle_length = 2 * interval
+  # SGD and RMSProp phases need different clip norms, since RMSProp
+  # preconditioning scales gradients up.
   clip_ratio = sgd_clip_norm / rmsprop_clip_norm
   sgd_decode_scale = sgd_clip_norm if rescale_to_unit_norm else 1.0
   rmsprop_decode_scale = (
       rmsprop_clip_norm
       if rescale_to_unit_norm
-      else rmsprop_clip_norm / sgd_clip_norm
+      else 1 / clip_ratio
   )
 
   def init_fn(params):
-    zeros = jax.tree.map(jnp.zeros_like, params)
     return _DP2RMSPropState(
         count=jnp.zeros([], dtype=jnp.int32),
         grad_accumulator=jax.tree.map(jnp.zeros_like, params),
@@ -335,7 +342,9 @@ def dp2_rmsprop(
       )
 
     def transform(gradients):
-      return jax.lax.cond(use_sgd, lambda x: x, rmsprop_transform, gradients)
+      return jax.lax.cond(
+          use_sgd, lambda grads: grads, rmsprop_transform, gradients
+      )
 
     return transform
 
