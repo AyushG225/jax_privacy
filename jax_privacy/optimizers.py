@@ -213,6 +213,196 @@ def scale_then_privatize(
   )
 
 
+class _DP2RMSPropState(NamedTuple):
+  """Optimizer state for DP2-RMSProp."""
+
+  count: jax.Array
+  grad_accumulator: optax.Updates
+  nu: optax.Updates
+  inner_state: optax.OptState
+
+
+def dp2_rmsprop(
+    sgd_learning_rate: float,
+    rmsprop_learning_rate: float,
+    interval: int,
+    sgd_clip_norm: float,
+    rmsprop_clip_norm: float,
+    decay: float = 0.9,
+    eps: float = 1e-8,
+    rescale_to_unit_norm: bool = True,
+    *,
+    inner_optimizer: optax.GradientTransformation | None = None,
+) -> AugmentedGradientTransformation:
+  r"""Constructs an AugmentedGradientTransformation for DP2-RMSProp.
+
+  This implements Algorithm 1 from Li et al. (2212.00309). It alternates
+  ``interval`` private SGD steps with ``interval`` private RMSProp steps. At
+  each SGD-to-RMSProp transition, the average private SGD gradient
+  :math:`\bar{g}` updates the delayed second moment:
+
+  .. math::
+
+    v \leftarrow \text{decay} \cdot v + (1 - \text{decay}) \bar{g}^{2}
+
+  Before clipping, SGD gradients are unchanged; RMSProp gradients are scaled
+  by ``sgd_clip_norm / rmsprop_clip_norm`` and divided by
+  :math:`\sqrt{v} + \text{eps}`. After clipping, aggregation, and noising,
+  ``update`` undoes only the clipping scale, preserving the preconditioning.
+  It delegates to the inner optimizer and scales its updates by the phase
+  learning rate. Inner state persists across phases.
+
+  The ``BandMFConfig`` must use ``l2_clip_norm=sgd_clip_norm``, the same
+  ``rescale_to_unit_norm``, and ``normalize_by`` equal to the expected batch
+  size. With the default ``normalize_by=1.0``, ``nu`` is built from batch sums
+  instead of means and comes out about batch-size-squared too large. These
+  settings are not checked.
+
+  Based on the authors' Apache-2.0 JAX implementation:
+  https://github.com/kenziyuliu/DP2.
+
+  Example Usage:
+    >>> optimizer = dp2_rmsprop(0.1, 0.01, 2, 1.0, 0.5)
+    >>> state = optimizer.init(jnp.zeros(1))
+    >>> updates, _ = optimizer.update(jnp.ones(1), state)
+    >>> bool(jnp.allclose(updates, jnp.array([-0.1])))
+    True
+
+  Args:
+    sgd_learning_rate: Nonnegative multiplier on inner updates in SGD phases.
+    rmsprop_learning_rate: Nonnegative multiplier on inner updates in RMSProp
+      phases.
+    interval: Positive integer number of steps in each phase.
+    sgd_clip_norm: Positive SGD clipping norm. Must match the enclosing
+      configuration's ``l2_clip_norm``.
+    rmsprop_clip_norm: Positive clipping norm for preconditioned gradients.
+    decay: Second-moment decay in ``[0, 1)``.
+    eps: Positive stability constant in the RMSProp denominator.
+    rescale_to_unit_norm: Must match the enclosing clipping configuration's
+      ``rescale_to_unit_norm``.
+    inner_optimizer: An :class:`optax.GradientTransformation`, defaulting to
+      ``optax.sgd(1.0)``. Its learning rate multiplies the phase rate; adaptive
+      inner optimizers change standard DP2-RMSProp. Receives ``params`` and
+      extra update arguments.
+
+  Returns:
+    An :class:`~jax_privacy.optimizers.AugmentedGradientTransformation` for
+    DP2-RMSProp.
+
+  Raises:
+    TypeError: If ``interval`` is not a Python integer.
+    ValueError: If a hyperparameter is outside its allowed range.
+  """
+  if isinstance(interval, bool) or not isinstance(interval, int):
+    raise TypeError('interval must be a Python integer.')
+  if interval <= 0:
+    raise ValueError('interval must be positive.')
+  if sgd_learning_rate < 0 or rmsprop_learning_rate < 0:
+    raise ValueError('learning rates must be nonnegative.')
+  if sgd_clip_norm <= 0 or rmsprop_clip_norm <= 0:
+    raise ValueError('clipping norms must be positive.')
+  if eps <= 0:
+    raise ValueError('eps must be positive.')
+  if not 0 <= decay < 1:
+    raise ValueError('decay must be in [0, 1).')
+
+  if inner_optimizer is None:
+    inner_optimizer = optax.sgd(1.0)
+  inner_optimizer = optax.with_extra_args_support(inner_optimizer)
+
+  cycle_length = 2 * interval
+  # SGD and RMSProp phases need different clip norms, since RMSProp
+  # preconditioning scales gradients up.
+  clip_ratio = sgd_clip_norm / rmsprop_clip_norm
+  sgd_decode_scale = sgd_clip_norm if rescale_to_unit_norm else 1.0
+  rmsprop_decode_scale = (
+      rmsprop_clip_norm
+      if rescale_to_unit_norm
+      else 1 / clip_ratio
+  )
+
+  def init_fn(params):
+    return _DP2RMSPropState(
+        count=jnp.zeros([], dtype=jnp.int32),
+        grad_accumulator=jax.tree.map(jnp.zeros_like, params),
+        nu=jax.tree.map(jnp.zeros_like, params),
+        inner_state=inner_optimizer.init(params),
+    )
+
+  def pre_clipping_transform(state):
+    use_sgd = state.count % cycle_length < interval
+
+    def rmsprop_transform(gradients):
+      return jax.tree.map(
+          lambda g, v: jnp.astype(
+              clip_ratio * g / (jnp.sqrt(v) + eps), g.dtype
+          ),
+          gradients,
+          state.nu,
+      )
+
+    def transform(gradients):
+      return jax.lax.cond(
+          use_sgd, lambda grads: grads, rmsprop_transform, gradients
+      )
+
+    return transform
+
+  def update_fn(updates, state, params=None, **extra_args):
+    cycle_step = state.count % cycle_length
+    use_sgd = cycle_step < interval
+    last_sgd_step = cycle_step == interval - 1
+
+    decode_scale = jnp.where(use_sgd, sgd_decode_scale, rmsprop_decode_scale)
+    decoded_grad = jax.tree.map(
+        lambda g: jnp.astype(decode_scale * g, g.dtype), updates
+    )
+
+    accumulator = jax.lax.cond(
+        use_sgd,
+        lambda acc: jax.tree.map(jnp.add, acc, decoded_grad),
+        lambda acc: acc,
+        state.grad_accumulator,
+    )
+
+    def finish_sgd_phase(accumulator):
+      average = jax.tree.map(lambda g: g / interval, accumulator)
+      new_nu = jax.tree.map(
+          lambda v, g: decay * v + (1.0 - decay) * jnp.square(g),
+          state.nu,
+          average,
+      )
+      return new_nu, jax.tree.map(jnp.zeros_like, accumulator)
+
+    new_nu, new_accumulator = jax.lax.cond(
+        last_sgd_step,
+        finish_sgd_phase,
+        lambda acc: (state.nu, acc),
+        accumulator,
+    )
+
+    inner_updates, new_inner_state = inner_optimizer.update(
+        decoded_grad, state.inner_state, params, **extra_args
+    )
+    learning_rate = jnp.where(use_sgd, sgd_learning_rate, rmsprop_learning_rate)
+    parameter_updates = jax.tree.map(
+        lambda u: jnp.astype(learning_rate * u, u.dtype), inner_updates
+    )
+    new_state = _DP2RMSPropState(
+        count=state.count + 1,
+        grad_accumulator=new_accumulator,
+        nu=new_nu,
+        inner_state=new_inner_state,
+    )
+    return parameter_updates, new_state
+
+  return AugmentedGradientTransformation(
+      init=init_fn,
+      update=update_fn,
+      pre_clipping_transform=pre_clipping_transform,
+  )
+
+
 def as_augmented_optimizer(
     optimizer: AugmentedGradientTransformation | optax.GradientTransformation,
 ) -> AugmentedGradientTransformation:
